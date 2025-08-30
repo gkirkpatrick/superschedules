@@ -2,6 +2,7 @@ from typing import List
 from datetime import date, datetime, time, timedelta
 from urllib.parse import urlparse
 import re
+import requests
 
 from asgiref.sync import async_to_sync
 
@@ -285,12 +286,11 @@ def create_source(request, payload: SourceCreateSchema):
         search_method=payload.search_method or Source.SearchMethod.MANUAL,
         status=Source.Status.NOT_RUN,
     )
+    # Trigger collection via collector API
     try:
-        from superschedules_collector import collect_source
-
-        collect_source(source.id)
-    except Exception:
-        pass
+        _trigger_collection(source)
+    except Exception as e:
+        print(f"Failed to trigger collection for source {source.id}: {e}")
     return 201, source
 
 
@@ -824,3 +824,69 @@ def _extract_follow_up_questions(response: str) -> List[str]:
     import re
     questions = re.findall(r'[^.!?]*\?', response)
     return [q.strip() for q in questions[:3]]  # Limit to 3 questions
+
+
+def _trigger_collection(source):
+    """Trigger event collection for a source via collector API."""
+    collector_url = getattr(settings, 'COLLECTOR_URL', 'http://localhost:8001')
+    
+    try:
+        # Call collector API to extract events
+        response = requests.post(
+            f"{collector_url}/extract",
+            json={
+                "url": source.base_url,
+                "extraction_hints": {
+                    "content_selectors": source.site_strategy.best_selectors if source.site_strategy else None,
+                    "additional_hints": {}
+                }
+            },
+            timeout=60  # Allow time for scraping
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success') and data.get('events'):
+                # Create events in database
+                created_count = 0
+                for event_data in data['events']:
+                    try:
+                        # Parse datetime strings
+                        start_time = datetime.fromisoformat(event_data['start_time'].replace('Z', '+00:00'))
+                        end_time = None
+                        if event_data.get('end_time'):
+                            end_time = datetime.fromisoformat(event_data['end_time'].replace('Z', '+00:00'))
+                        
+                        # Create event
+                        Event.objects.create(
+                            source=source,
+                            external_id=event_data['external_id'],
+                            title=event_data['title'],
+                            description=event_data['description'],
+                            location=event_data['location'],
+                            start_time=start_time,
+                            end_time=end_time,
+                            url=event_data.get('url'),
+                            metadata_tags=event_data.get('tags', []),
+                        )
+                        created_count += 1
+                    except Exception as e:
+                        print(f"Failed to create event: {e}")
+                        continue
+                
+                # Update source status
+                source.status = Source.Status.PROCESSED
+                source.last_run_at = timezone.now()
+                source.save()
+                
+                print(f"Successfully created {created_count} events for source {source.id}")
+            else:
+                source.status = Source.Status.PROCESSED  # No events found but processed
+                source.last_run_at = timezone.now()
+                source.save()
+                print(f"No events found for source {source.id}")
+        else:
+            print(f"Collector API returned error: {response.status_code} - {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to connect to collector API: {e}")
